@@ -1,0 +1,189 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Postiz — PRODUCTION compose, FULL (with Elasticsearch)
+#
+# Same prod wiring as docker-compose.prod.yaml (shared phantompulse-postgres for
+# Postiz, own Temporal Postgres, loopback bind, HTTPS subdomain via nginx) — the
+# ONLY difference is Temporal keeps its Elasticsearch visibility store (stock
+# Postiz setup). Heavier (~1 GB more RAM) but matches upstream exactly.
+#
+# Use this to A/B against docker-compose.prod.yaml (the trimmed, no-ES variant).
+# They share container names / port 4007 / the shared DB, so run only ONE at a
+# time: `docker compose -f <file> down` before bringing up the other.
+#
+# Prep + REPLACE steps are identical to docker-compose.prod.yaml — see its header
+# (create the postiz DB/user, verify the external network name, replace subdomain
+# ×3, JWT_SECRET, DB password, Instagram creds).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postiz:
+    image: ghcr.io/gitroomhq/postiz-app:latest
+    container_name: postiz
+    restart: always
+    environment:
+      # === Public URLs (browser-facing) — your HTTPS subdomain ===
+      MAIN_URL: 'https://postiz.example.com'
+      FRONTEND_URL: 'https://postiz.example.com'
+      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.example.com/api'
+      BACKEND_INTERNAL_URL: 'http://localhost:3000'   # internal to the container — leave as-is
+
+      # === Secrets / infra ===
+      JWT_SECRET: 'REPLACE_WITH_LONG_RANDOM_SECRET'
+      # Reuses the existing phantompulse-postgres server, database "postiz-db".
+      DATABASE_URL: 'postgresql://postiz:REPLACE_DB_PASSWORD@phantompulse-postgres:5432/postiz-db'
+      REDIS_URL: 'redis://postiz-redis:6379'
+      TEMPORAL_ADDRESS: 'temporal:7233'
+
+      IS_GENERAL: 'true'
+      DISABLE_REGISTRATION: 'false'   # PhantomPulse provisions orgs via /auth/register
+      RUN_CRON: 'true'
+
+      # === Media storage — local disk (Postiz only fetches our S3 URLs; stores little) ===
+      STORAGE_PROVIDER: 'local'
+      UPLOAD_DIRECTORY: '/uploads'
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: '/uploads'
+
+      # === Social provider credentials — fill the ones you use ===
+      INSTAGRAM_APP_ID: 'REPLACE_INSTAGRAM_APP_ID'
+      INSTAGRAM_APP_SECRET: 'REPLACE_INSTAGRAM_APP_SECRET'
+      FACEBOOK_APP_ID: ''
+      FACEBOOK_APP_SECRET: ''
+      LINKEDIN_CLIENT_ID: ''
+      LINKEDIN_CLIENT_SECRET: ''
+      X_API_KEY: ''
+      X_API_SECRET: ''
+      YOUTUBE_CLIENT_ID: ''
+      YOUTUBE_CLIENT_SECRET: ''
+      TIKTOK_CLIENT_ID: ''
+      TIKTOK_CLIENT_SECRET: ''
+
+      # === Misc ===
+      API_LIMIT: 30
+      NX_ADD_PLUGINS: 'false'
+
+    volumes:
+      - postiz-config:/config/
+      - postiz-uploads:/uploads/
+    ports:
+      - "127.0.0.1:4007:5000"   # loopback only — nginx terminates TLS in front
+    networks:
+      - postiz     # reach redis + temporal
+      - shared     # reach the existing phantompulse-postgres
+    depends_on:
+      postiz-redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "const r=require('http').get('http://localhost:5000/',res=>process.exit(res.statusCode<500?0:1));r.on('error',()=>process.exit(1));r.setTimeout(4000,()=>{r.destroy();process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  postiz-redis:
+    image: redis:7.2
+    container_name: postiz-redis
+    restart: always
+    volumes:
+      - postiz-redis-data:/data
+    networks:
+      - postiz
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── Temporal stack (WITH Elasticsearch — stock Postiz visibility) ──
+  temporal-elasticsearch:
+    image: elasticsearch:7.17.27
+    container_name: temporal-elasticsearch
+    restart: always
+    environment:
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=512mb
+      - cluster.routing.allocation.disk.watermark.high=256mb
+      - cluster.routing.allocation.disk.watermark.flood_stage=128mb
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
+      - xpack.security.enabled=false
+    networks:
+      - postiz
+    expose:
+      - 9200
+    volumes:
+      - temporal-elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS \"http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s\" || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  temporal-postgresql:
+    image: postgres:16
+    container_name: temporal-postgresql
+    restart: always
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    networks:
+      - postiz
+    expose:
+      - 5432
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    container_name: temporal
+    restart: always
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+      temporal-elasticsearch:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgresql
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      - ENABLE_ES=true
+      - ES_SEEDS=temporal-elasticsearch
+      - ES_VERSION=v7
+    networks:
+      - postiz
+    expose:
+      - 7233
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+volumes:
+  postiz-config:
+  postiz-uploads:
+  postiz-redis-data:
+  temporal-postgres-data:
+  temporal-elasticsearch-data:
+
+networks:
+  postiz:
+    driver: bridge
+  shared:
+    external: true
+    name: phantom-pulse_default   # verify: docker inspect phantompulse-postgres -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'

@@ -1,0 +1,184 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Postiz — PRODUCTION compose (PhantomPulse self-host, shared Postgres)
+#
+# Trimmed vs stock: no Elasticsearch (Temporal uses Postgres visibility), no
+# debug/admin/UI extras. Postiz reuses the EXISTING phantompulse-postgres server
+# (its own database), so this stack adds only: postiz + redis + temporal + a
+# small temporal-postgres. Bound to 127.0.0.1 and served over HTTPS by the nginx
+# already on this box.
+#
+# ── ONE-TIME PREP on the VM (before `up`) ──
+#   1. Create Postiz's DB + user inside the existing Postgres
+#      (replace <APPUSER> with POSTGRES_USER from /opt/phantom-pulse/docker-compose.yml):
+#        docker exec -it phantompulse-postgres psql -U <APPUSER> \
+#          -c "CREATE USER postiz WITH PASSWORD 'REPLACE_DB_PASSWORD';"
+#        docker exec -it phantompulse-postgres psql -U <APPUSER> \
+#          -c "CREATE DATABASE \"postiz-db\" OWNER postiz;"
+#   2. Confirm the external network name that phantompulse-postgres is on:
+#        docker inspect phantompulse-postgres \
+#          -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+#      Put it in `networks.shared.name` at the bottom (default guess: phantom-pulse_default).
+#   3. Keep ./dynamicconfig next to this file (Temporal bind-mounts it).
+#
+# ── REPLACE before deploy ──
+#   • postiz.example.com  → your real subdomain (3×)
+#   • REPLACE_WITH_LONG_RANDOM_SECRET → openssl rand -hex 32
+#   • REPLACE_DB_PASSWORD → the password you set in step 1 above
+#   • Instagram (and any other) app id/secret
+#
+# ── After it's up (.NET appsettings) ──
+#   Postiz:BaseUrl            = http://localhost:4007/api          (same box, server→server)
+#   Postiz:ConnectRedirectUrl = https://<your-frontend>/social/connected
+#   …and whitelist https://postiz.example.com callbacks in the Meta app.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  postiz:
+    image: ghcr.io/gitroomhq/postiz-app:latest   # consider pinning a version tag for prod
+    container_name: postiz
+    restart: always
+    environment:
+      # === Public URLs (browser-facing) — your HTTPS subdomain ===
+      MAIN_URL: 'https://postiz.example.com'
+      FRONTEND_URL: 'https://postiz.example.com'
+      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.example.com/api'
+      BACKEND_INTERNAL_URL: 'http://localhost:3000'   # internal to the container — leave as-is
+
+      # === Secrets / infra ===
+      JWT_SECRET: 'REPLACE_WITH_LONG_RANDOM_SECRET'
+      # Reuses the existing phantompulse-postgres server, database "postiz-db" (created in prep step 1).
+      DATABASE_URL: 'postgresql://postiz:REPLACE_DB_PASSWORD@phantompulse-postgres:5432/postiz-db'
+      REDIS_URL: 'redis://postiz-redis:6379'
+      TEMPORAL_ADDRESS: 'temporal:7233'
+
+      IS_GENERAL: 'true'
+      # Keep registration ENABLED — PhantomPulse provisions one Postiz org per tenant via
+      # /auth/register. Postiz isn't publicly exposed for signup (loopback + nginx + our flow).
+      DISABLE_REGISTRATION: 'false'
+      RUN_CRON: 'true'
+
+      # === Media storage — local disk (Postiz only fetches our S3 URLs; stores little) ===
+      STORAGE_PROVIDER: 'local'
+      UPLOAD_DIRECTORY: '/uploads'
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: '/uploads'
+
+      # === Social provider credentials — fill the ones you use ===
+      INSTAGRAM_APP_ID: 'REPLACE_INSTAGRAM_APP_ID'
+      INSTAGRAM_APP_SECRET: 'REPLACE_INSTAGRAM_APP_SECRET'
+      FACEBOOK_APP_ID: ''
+      FACEBOOK_APP_SECRET: ''
+      LINKEDIN_CLIENT_ID: ''
+      LINKEDIN_CLIENT_SECRET: ''
+      X_API_KEY: ''
+      X_API_SECRET: ''
+      YOUTUBE_CLIENT_ID: ''
+      YOUTUBE_CLIENT_SECRET: ''
+      TIKTOK_CLIENT_ID: ''
+      TIKTOK_CLIENT_SECRET: ''
+
+      # === Misc ===
+      API_LIMIT: 30
+      NX_ADD_PLUGINS: 'false'
+
+    volumes:
+      - postiz-config:/config/
+      - postiz-uploads:/uploads/
+    ports:
+      # Loopback only — nginx terminates TLS for the subdomain and forwards to 127.0.0.1:4007.
+      - "127.0.0.1:4007:5000"
+    networks:
+      - postiz     # reach redis + temporal
+      - shared     # reach the existing phantompulse-postgres
+    # NOTE: phantompulse-postgres lives in another compose project, so it can't be a depends_on
+    # here — Postiz retries the DB connection on boot until it's reachable.
+    depends_on:
+      postiz-redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "const r=require('http').get('http://localhost:5000/',res=>process.exit(res.statusCode<500?0:1));r.on('error',()=>process.exit(1));r.setTimeout(4000,()=>{r.destroy();process.exit(1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  postiz-redis:
+    image: redis:7.2
+    container_name: postiz-redis
+    restart: always
+    volumes:
+      - postiz-redis-data:/data
+    networks:
+      - postiz
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── Temporal (scheduler Postiz depends on) — kept on its OWN small Postgres, no Elasticsearch.
+  #    Intentionally NOT merged into phantompulse-postgres: Temporal self-manages schema/DBs, so
+  #    isolating it keeps that churn off your primary app database. ──
+  temporal-postgresql:
+    image: postgres:16
+    container_name: temporal-postgresql
+    restart: always
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    networks:
+      - postiz
+    expose:
+      - 5432
+    volumes:
+      - temporal-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    container_name: temporal
+    restart: always
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgresql
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      # ENABLE_ES intentionally unset → Temporal uses SQL (Postgres) visibility.
+    networks:
+      - postiz
+    expose:
+      - 7233
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+volumes:
+  postiz-config:
+  postiz-uploads:
+  postiz-redis-data:
+  temporal-postgres-data:
+
+networks:
+  postiz:
+    driver: bridge
+  # The existing network that phantompulse-postgres is attached to (verify via prep step 2).
+  shared:
+    external: true
+    name: phantom-pulse_default
