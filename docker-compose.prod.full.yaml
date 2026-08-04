@@ -22,9 +22,9 @@ services:
     restart: always
     environment:
       # === Public URLs (browser-facing) — your HTTPS subdomain ===
-      MAIN_URL: 'https://postiz.example.com'
-      FRONTEND_URL: 'https://postiz.example.com'
-      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.example.com/api'
+      MAIN_URL: 'https://postiz.phantomcore.ae'
+      FRONTEND_URL: 'https://postiz.phantomcore.ae'
+      NEXT_PUBLIC_BACKEND_URL: 'https://postiz.phantomcore.ae/api'
       BACKEND_INTERNAL_URL: 'http://localhost:3000'   # internal to the container — leave as-is
 
       # === Secrets / infra ===
