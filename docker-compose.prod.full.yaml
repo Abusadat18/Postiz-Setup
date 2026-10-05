@@ -17,7 +17,9 @@
 
 services:
   postiz:
-    image: ghcr.io/gitroomhq/postiz-app:latest
+    # Our fork (github.com/Abusadat18/postiz-app, branch phantom/main). Set PHANTOM_POSTIZ_TAG to
+    # a sha-<commit> tag to pin a build; the default follows the latest phantom/main build.
+    image: ghcr.io/abusadat18/phantom-postiz:${PHANTOM_POSTIZ_TAG:-latest}
     container_name: postiz
     restart: always
     environment:
