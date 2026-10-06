@@ -10,9 +10,12 @@
 # They share container names / port 4007 / the shared DB, so run only ONE at a
 # time: `docker compose -f <file> down` before bringing up the other.
 #
-# Prep + REPLACE steps are identical to docker-compose.prod.yaml — see its header
-# (create the postiz DB/user, verify the external network name, replace subdomain
-# ×3, JWT_SECRET, DB password, Instagram creds).
+# Prep steps are identical to docker-compose.prod.yaml — see its header (create
+# the postiz DB/user, verify the external network name, replace subdomain ×3).
+#
+# Secrets and provider credentials live in .env next to this file (untracked —
+# copy .env.example). Never edit them into this file on the VPS: the CI deploy
+# runs `git reset --hard` here and refuses to start while tracked files differ.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -22,6 +25,10 @@ services:
     image: ghcr.io/abusadat18/phantom-postiz:${PHANTOM_POSTIZ_TAG:-latest}
     container_name: postiz
     restart: always
+    # Provider credentials (Instagram, TikTok, Telegram, …) come from here, so adding one
+    # needs only a .env edit and `up -d postiz`. Keys under `environment` win over it.
+    env_file:
+      - .env
     environment:
       # === Public URLs (browser-facing) — your HTTPS subdomain ===
       MAIN_URL: 'https://postiz.phantomcore.ae'
@@ -30,9 +37,11 @@ services:
       BACKEND_INTERNAL_URL: 'http://localhost:3000'   # internal to the container — leave as-is
 
       # === Secrets / infra ===
-      JWT_SECRET: 'REPLACE_WITH_LONG_RANDOM_SECRET'
+      # Listed here (not only in env_file) so `docker compose config` fails when they are
+      # missing, before anything restarts.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       # Reuses the existing phantompulse-postgres server, database "postiz-db".
-      DATABASE_URL: 'postgresql://postiz:REPLACE_DB_PASSWORD@phantompulse-postgres:5432/postiz-db'
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       REDIS_URL: 'redis://postiz-redis:6379'
       TEMPORAL_ADDRESS: 'temporal:7233'
 
@@ -44,20 +53,6 @@ services:
       STORAGE_PROVIDER: 'local'
       UPLOAD_DIRECTORY: '/uploads'
       NEXT_PUBLIC_UPLOAD_DIRECTORY: '/uploads'
-
-      # === Social provider credentials — fill the ones you use ===
-      INSTAGRAM_APP_ID: 'REPLACE_INSTAGRAM_APP_ID'
-      INSTAGRAM_APP_SECRET: 'REPLACE_INSTAGRAM_APP_SECRET'
-      FACEBOOK_APP_ID: ''
-      FACEBOOK_APP_SECRET: ''
-      LINKEDIN_CLIENT_ID: ''
-      LINKEDIN_CLIENT_SECRET: ''
-      X_API_KEY: ''
-      X_API_SECRET: ''
-      YOUTUBE_CLIENT_ID: ''
-      YOUTUBE_CLIENT_SECRET: ''
-      TIKTOK_CLIENT_ID: ''
-      TIKTOK_CLIENT_SECRET: ''
 
       # === Misc ===
       API_LIMIT: 30

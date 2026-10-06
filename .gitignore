@@ -1,1 +1,3 @@
 .vscode
+# Real secrets for docker-compose.prod.full.yaml; see the example file next to it
+.env
